@@ -1,11 +1,11 @@
 package auth
 
 import (
+	"butler-server/models"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
 	"net/http"
-	"simple-butler-server/models"
 	"strings"
 )
 

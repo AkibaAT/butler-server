@@ -2,20 +2,22 @@ package handlers
 
 import (
 	"archive/zip"
+	"butler-server/auth"
+	"butler-server/models"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
-	"simple-butler-server/auth"
-	"simple-butler-server/models"
-	"simple-butler-server/storage"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
+	"github.com/minio/minio-go/v7"
 )
 
 // validateNamespaceAccess checks if the user can access the given namespace
@@ -27,12 +29,47 @@ func (h *WharfHandlers) validateNamespaceAccess(user *models.User, namespace str
 }
 
 type WharfHandlers struct {
-	db      models.Database
-	storage *storage.LocalStorage
+	db          models.Database
+	minioClient *minio.Client
+	bucketName  string
 }
 
-func NewWharfHandlers(db models.Database, storage *storage.LocalStorage) *WharfHandlers {
-	return &WharfHandlers{db: db, storage: storage}
+func NewWharfHandlers(db models.Database, minioClient *minio.Client, bucketName string) *WharfHandlers {
+	return &WharfHandlers{db: db, minioClient: minioClient, bucketName: bucketName}
+}
+
+// MinIO helper methods
+func (h *WharfHandlers) GetPresignedUploadURL(objectName string, expiry time.Duration) (string, error) {
+	ctx := context.Background()
+	presignedURL, err := h.minioClient.PresignedPutObject(ctx, h.bucketName, objectName, expiry)
+	if err != nil {
+		return "", fmt.Errorf("failed to generate presigned upload URL: %v", err)
+	}
+	return presignedURL.String(), nil
+}
+
+func (h *WharfHandlers) FileExists(objectName string) bool {
+	ctx := context.Background()
+	_, err := h.minioClient.StatObject(ctx, h.bucketName, objectName, minio.StatObjectOptions{})
+	return err == nil
+}
+
+func (h *WharfHandlers) GetFileSize(objectName string) (int64, error) {
+	ctx := context.Background()
+	stat, err := h.minioClient.StatObject(ctx, h.bucketName, objectName, minio.StatObjectOptions{})
+	if err != nil {
+		return 0, fmt.Errorf("failed to get object stat: %v", err)
+	}
+	return stat.Size, nil
+}
+
+func (h *WharfHandlers) GetSignedURL(objectName string, expiry time.Duration) (string, error) {
+	ctx := context.Background()
+	presignedURL, err := h.minioClient.PresignedGetObject(ctx, h.bucketName, objectName, expiry, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to generate signed URL: %v", err)
+	}
+	return presignedURL.String(), nil
 }
 
 // GET /wharf/status - Check wharf infrastructure status
@@ -169,6 +206,10 @@ func (h *WharfHandlers) GetChannel(w http.ResponseWriter, r *http.Request) {
 
 	// Get user from context (set by auth middleware)
 	user, ok := auth.GetUser(r.Context())
+	if !ok || user == nil {
+		http.Error(w, `{"errors":["user not found in context"]}`, http.StatusInternalServerError)
+		return
+	}
 
 	// Validate namespace access
 	err := h.validateNamespaceAccess(user, username)
@@ -177,19 +218,24 @@ func (h *WharfHandlers) GetChannel(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"errors":["access denied"]}`, http.StatusForbidden)
 		return
 	}
-	if !ok || user == nil {
-		http.Error(w, `{"errors":["user not found in context"]}`, http.StatusInternalServerError)
-		return
+
+	// Find the target user (for namespace access)
+	var targetUserID int64
+	if user.Username == username {
+		// User accessing their own namespace
+		targetUserID = user.ID
+	} else {
+		// Admin user accessing another user's namespace - look up the target user
+		targetUser, err := h.db.GetUserByUsername(username)
+		if err != nil {
+			http.Error(w, `{"errors":["target user not found"]}`, http.StatusNotFound)
+			return
+		}
+		targetUserID = targetUser.ID
 	}
 
-	// For now, only allow users to access their own games
-	if user.Username != username {
-		http.Error(w, `{"errors":["access denied"]}`, http.StatusForbidden)
-		return
-	}
-
-	// Find the game
-	game, err := h.db.GetGameByUserAndTitle(user.ID, gamename)
+	// Find the game owned by the target user
+	game, err := h.db.GetGameByUserAndTitle(targetUserID, gamename)
 	if err != nil {
 		http.Error(w, `{"errors":["game not found"]}`, http.StatusNotFound)
 		return
@@ -335,12 +381,19 @@ func (h *WharfHandlers) CreateBuild(w http.ResponseWriter, r *http.Request) {
 	// For this simple implementation, we'll create a game and upload if they don't exist
 	// In practice, you'd want better lookup logic
 
-	// Create or find game
-	fmt.Printf("Looking for existing game: user_id=%d, title='%s'\n", user.ID, gameName)
+	// Find the namespace owner (the user who owns this namespace)
+	namespaceOwner, err := h.db.GetUserByUsername(username)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"errors":["namespace owner not found: %s"]}`, username), http.StatusNotFound)
+		return
+	}
 
-	// First try to find existing game
+	// Create or find game
+	fmt.Printf("Looking for existing game: namespace_owner_id=%d, title='%s'\n", namespaceOwner.ID, gameName)
+
+	// First try to find existing game owned by the namespace owner
 	var games []*models.Game
-	games, err = h.db.GetGamesByUserID(user.ID)
+	games, err = h.db.GetGamesByUserID(namespaceOwner.ID)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"errors":["%s"]}`, err.Error()), http.StatusInternalServerError)
 		return
@@ -357,9 +410,9 @@ func (h *WharfHandlers) CreateBuild(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if game == nil {
-		// Create new game
+		// Create new game owned by the namespace owner
 		game = &models.Game{
-			UserID:         user.ID,
+			UserID:         namespaceOwner.ID,
 			Title:          gameName,
 			Type:           "default",
 			Classification: "game",
@@ -370,7 +423,7 @@ func (h *WharfHandlers) CreateBuild(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, fmt.Sprintf(`{"errors":["%s"]}`, err.Error()), http.StatusInternalServerError)
 			return
 		}
-		fmt.Printf("Created new game: ID=%d, Title='%s'\n", game.ID, game.Title)
+		fmt.Printf("Created new game: ID=%d, Title='%s', Owner='%s'\n", game.ID, game.Title, namespaceOwner.Username)
 	}
 
 	// Create or find upload - look for existing upload that matches the channel
@@ -626,11 +679,18 @@ func (h *WharfHandlers) CreateBuildFile(w http.ResponseWriter, r *http.Request) 
 		req.SubType = "default"
 	}
 
-	// Generate upload session ID
-	sessionID := uuid.New().String()
+	// Generate unique file ID for storage
+	fileID := uuid.New().String()
 
-	// Create storage path
-	storagePath := fmt.Sprintf("builds/%d/%s_%s_%s", buildID, req.Type, req.SubType, sessionID)
+	// Create storage path in MinIO
+	storagePath := fmt.Sprintf("builds/%d/%s_%s_%s", buildID, req.Type, req.SubType, fileID)
+
+	// Generate presigned upload URL for MinIO (expires in 1 hour)
+	uploadURL, err := h.GetPresignedUploadURL(storagePath, time.Hour)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"errors":["failed to generate upload URL: %s"]}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
 
 	// Create build file
 	buildFile := &models.BuildFile{
@@ -639,24 +699,10 @@ func (h *WharfHandlers) CreateBuildFile(w http.ResponseWriter, r *http.Request) 
 		SubType:     req.SubType,
 		State:       "uploading",
 		StoragePath: storagePath,
-		UploadURL:   fmt.Sprintf("http://127.0.0.1:8080/upload/%s", sessionID),
+		UploadURL:   uploadURL,
 	}
 
 	err = h.db.CreateBuildFile(buildFile)
-	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"errors":["%s"]}`, err.Error()), http.StatusInternalServerError)
-		return
-	}
-
-	// Create upload session
-	session := &models.UploadSession{
-		ID:          sessionID,
-		BuildFileID: buildFile.ID,
-		StoragePath: storagePath,
-		State:       "active",
-	}
-
-	err = h.db.CreateUploadSession(session)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"errors":["%s"]}`, err.Error()), http.StatusInternalServerError)
 		return
@@ -755,8 +801,21 @@ func (h *WharfHandlers) FinalizeBuildFile(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Update build file with final size and mark as uploaded
-	buildFile.Size = req.Size
+	// Verify that the file was actually uploaded to MinIO
+	if !h.FileExists(buildFile.StoragePath) {
+		http.Error(w, `{"errors":["file not found in storage - upload may have failed"]}`, http.StatusBadRequest)
+		return
+	}
+
+	// Get actual file size from MinIO to verify
+	actualSize, err := h.GetFileSize(buildFile.StoragePath)
+	if err != nil {
+		http.Error(w, `{"errors":["could not verify file size in storage"]}`, http.StatusInternalServerError)
+		return
+	}
+
+	// Update build file with actual size from storage and mark as uploaded
+	buildFile.Size = actualSize
 	buildFile.State = "uploaded"
 
 	err = h.db.UpdateBuildFile(buildFile)
@@ -764,6 +823,8 @@ func (h *WharfHandlers) FinalizeBuildFile(w http.ResponseWriter, r *http.Request
 		http.Error(w, fmt.Sprintf(`{"errors":["%s"]}`, err.Error()), http.StatusInternalServerError)
 		return
 	}
+
+	fmt.Printf("File upload verified: %s (size: %d bytes)\n", buildFile.StoragePath, actualSize)
 
 	// Check if all files for this build are now uploaded and update build state
 	err = h.checkAndUpdateBuildState(buildID)
@@ -850,19 +911,10 @@ func (h *WharfHandlers) checkAndUpdateBuildState(buildID int64) error {
 func (h *WharfHandlers) generateArchiveFile(build *models.Build) error {
 	fmt.Printf("Generating archive file for build %d\n", build.ID)
 
-	// For now, we'll create a simple implementation that reconstructs content from patches
-	// In a real implementation, you'd want to apply patches to reconstruct the full content
+	// Generate archive from all build files in MinIO
+	// This creates a ZIP archive containing all files from this build
 
-	// Get the upload to find the original content
-	upload, err := h.db.GetUploadByID(build.UploadID)
-	if err != nil {
-		return fmt.Errorf("failed to get upload: %w", err)
-	}
-
-	// For this simplified implementation, we'll create an archive from the original upload content
-	// In a real implementation, you'd apply all patches to reconstruct the current state
-
-	archivePath, archiveSize, err := h.createArchiveFromUpload(upload)
+	archivePath, archiveSize, err := h.createArchiveFromBuildFiles(build.ID)
 	if err != nil {
 		return fmt.Errorf("failed to create archive: %w", err)
 	}
@@ -905,71 +957,84 @@ func (h *WharfHandlers) generateArchiveFile(build *models.Build) error {
 	return nil
 }
 
-// createArchiveFromUpload creates a ZIP archive from the original upload content
-func (h *WharfHandlers) createArchiveFromUpload(upload *models.Upload) (string, int64, error) {
+// createArchiveFromBuildFiles creates a ZIP archive from all build files in MinIO
+func (h *WharfHandlers) createArchiveFromBuildFiles(buildID int64) (string, int64, error) {
+	// Get all build files for this build
+	buildFiles, err := h.db.GetBuildFilesByBuildID(buildID)
+	if err != nil {
+		return "", 0, fmt.Errorf("failed to get build files: %w", err)
+	}
 	// Create a temporary file for the archive
 	tempFile, err := os.CreateTemp("", "archive-*.zip")
 	if err != nil {
 		return "", 0, fmt.Errorf("failed to create temp file: %w", err)
 	}
+	defer tempFile.Close()
 
 	// Create ZIP writer
 	zipWriter := zip.NewWriter(tempFile)
+	defer zipWriter.Close()
 
-	// Get the original upload file path
-	uploadPath := fmt.Sprintf("storage/uploads/%d/%s", upload.ID, upload.Filename)
+	ctx := context.Background()
 
-	// Check if the upload file exists
-	if _, err := os.Stat(uploadPath); os.IsNotExist(err) {
-		// If the original upload doesn't exist, create a simple archive with basic content
-		// This handles the case where we only have patches
-		writer, err := zipWriter.Create("game.txt")
+	// Add each build file to the archive
+	for _, buildFile := range buildFiles {
+		if buildFile.State != "uploaded" {
+			continue // Skip files that aren't fully uploaded
+		}
+
+		// Get the file from MinIO
+		object, err := h.minioClient.GetObject(ctx, h.bucketName, buildFile.StoragePath, minio.GetObjectOptions{})
 		if err != nil {
+			fmt.Printf("Warning: failed to get file %s from MinIO: %v\n", buildFile.StoragePath, err)
+			continue
+		}
+
+		// Create entry in ZIP
+		filename := fmt.Sprintf("%s_%s", buildFile.Type, buildFile.SubType)
+		if buildFile.Type == "archive" {
+			filename += ".zip"
+		}
+
+		writer, err := zipWriter.Create(filename)
+		if err != nil {
+			object.Close()
 			return "", 0, fmt.Errorf("failed to create zip entry: %w", err)
 		}
 
-		content := "Hello World v11\nThis is an updated version with build state transitions!\nTesting the new completed state functionality.\nNow testing all butler commands systematically!\nTesting archive file generation for fetch!\nThis should trigger archive generation!\nFixed StoragePath for archive files!\nFixed ZIP file corruption issue!"
-		_, err = writer.Write([]byte(content))
-		if err != nil {
-			return "", 0, fmt.Errorf("failed to write content: %w", err)
-		}
-	} else {
-		// Read the original upload file
-		uploadFile, err := os.Open(uploadPath)
-		if err != nil {
-			return "", 0, fmt.Errorf("failed to open upload file: %w", err)
-		}
-		defer uploadFile.Close()
-
-		// Add the upload file to the archive
-		writer, err := zipWriter.Create(upload.Filename)
-		if err != nil {
-			return "", 0, fmt.Errorf("failed to create zip entry: %w", err)
-		}
-
-		_, err = io.Copy(writer, uploadFile)
+		// Copy file content to ZIP
+		_, err = io.Copy(writer, object)
+		object.Close()
 		if err != nil {
 			return "", 0, fmt.Errorf("failed to copy file to archive: %w", err)
 		}
+
+		fmt.Printf("Added file %s to archive\n", filename)
 	}
 
-	// Close the zip writer to finalize the archive
+	// If no files were added, create a placeholder
+	if len(buildFiles) == 0 {
+		writer, err := zipWriter.Create("README.txt")
+		if err != nil {
+			return "", 0, fmt.Errorf("failed to create placeholder: %w", err)
+		}
+		content := fmt.Sprintf("Build %d\nGenerated at: %s\nNo files uploaded yet.\n", buildID, time.Now().Format(time.RFC3339))
+		_, err = writer.Write([]byte(content))
+		if err != nil {
+			return "", 0, fmt.Errorf("failed to write placeholder: %w", err)
+		}
+	}
+
+	// Close ZIP writer to finalize
 	err = zipWriter.Close()
 	if err != nil {
-		tempFile.Close()
 		return "", 0, fmt.Errorf("failed to close zip writer: %w", err)
 	}
 
-	// Close the file
-	err = tempFile.Close()
-	if err != nil {
-		return "", 0, fmt.Errorf("failed to close file: %w", err)
-	}
-
-	// Get the file size
+	// Get file size
 	stat, err := os.Stat(tempFile.Name())
 	if err != nil {
-		return "", 0, fmt.Errorf("failed to stat archive file: %w", err)
+		return "", 0, fmt.Errorf("failed to get file size: %w", err)
 	}
 
 	return tempFile.Name(), stat.Size(), nil
@@ -1009,63 +1074,18 @@ func (h *WharfHandlers) GetBuildFileDownload(w http.ResponseWriter, r *http.Requ
 	}
 
 	// Check if file exists in storage
-	if !h.storage.FileExists(buildFile.StoragePath) {
+	if !h.FileExists(buildFile.StoragePath) {
 		http.Error(w, `{"errors":["file not found in storage"]}`, http.StatusNotFound)
 		return
 	}
 
-	// Get file size for Content-Length header
-	fileSize, err := h.storage.GetFileSize(buildFile.StoragePath)
+	// Generate signed URL for secure download (expires in 1 hour)
+	signedURL, err := h.GetSignedURL(buildFile.StoragePath, time.Hour)
 	if err != nil {
-		http.Error(w, `{"errors":["could not get file size"]}`, http.StatusInternalServerError)
+		http.Error(w, `{"errors":["could not generate download URL"]}`, http.StatusInternalServerError)
 		return
 	}
 
-	// Open file for serving
-	filePath := h.storage.GetFilePath(buildFile.StoragePath)
-	file, err := os.Open(filePath)
-	if err != nil {
-		http.Error(w, `{"errors":["could not open file"]}`, http.StatusInternalServerError)
-		return
-	}
-	defer file.Close()
-
-	// Set headers for file download
-	contentType := "application/octet-stream"
-	if buildFile.Type == "archive" {
-		contentType = "application/zip"
-	}
-	w.Header().Set("Content-Type", contentType)
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", fileSize))
-	// Set appropriate filename with extension
-	filename := fmt.Sprintf("build_%d_%s_%s", buildID, buildFile.Type, buildFile.SubType)
-	if buildFile.Type == "archive" {
-		filename += ".zip"
-	}
-	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
-
-	// Handle range requests
-	rangeHeader := r.Header.Get("Range")
-	if rangeHeader != "" {
-		// For simplicity, we'll support the common case of "bytes=0-" (full file)
-		// A full implementation would parse the range and serve partial content
-		w.Header().Set("Accept-Ranges", "bytes")
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", fileSize-1, fileSize))
-		w.WriteHeader(http.StatusPartialContent)
-	}
-
-	// For HEAD requests, only send headers
-	if r.Method == "HEAD" {
-		return
-	}
-
-	// Stream file to response
-	fmt.Printf("Starting file stream for build %d, file %d\n", buildID, fileID)
-	bytesWritten, err := io.Copy(w, file)
-	if err != nil {
-		// Can't return HTTP error after headers are sent, just log
-		fmt.Printf("Error streaming file: %v\n", err)
-		return
-	}
-	fmt.Printf("File stream completed: %d bytes written\n", bytesWritten)
+	// Redirect to signed URL for direct download from MinIO
+	http.Redirect(w, r, signedURL, http.StatusTemporaryRedirect)
 }

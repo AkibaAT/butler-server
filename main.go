@@ -1,18 +1,66 @@
 package main
 
 import (
+	"butler-server/auth"
+	"butler-server/handlers"
+	"butler-server/models"
+	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
-	"simple-butler-server/auth"
-	"simple-butler-server/handlers"
-	"simple-butler-server/models"
-	"simple-butler-server/storage"
+	"strings"
+	"time"
 
 	"github.com/gorilla/mux"
+	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
 )
+
+// initializeMinIO creates and configures MinIO client
+func initializeMinIO() (*minio.Client, string, error) {
+	endpoint := getEnvOrDefault("MINIO_ENDPOINT", "localhost:9000")
+	accessKey := getEnvOrDefault("MINIO_ACCESS_KEY", "ddevminio")
+	secretKey := getEnvOrDefault("MINIO_SECRET_KEY", "ddevminio")
+	bucketName := getEnvOrDefault("MINIO_BUCKET", "butler-storage")
+	useSSL := getEnvOrDefault("MINIO_USE_SSL", "false") == "true"
+
+	// Initialize MinIO client
+	client, err := minio.New(endpoint, &minio.Options{
+		Creds:  credentials.NewStaticV4(accessKey, secretKey, ""),
+		Secure: useSSL,
+	})
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to create MinIO client: %v", err)
+	}
+
+	// Ensure bucket exists
+	ctx := context.Background()
+	exists, err := client.BucketExists(ctx, bucketName)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to check if bucket exists: %v", err)
+	}
+
+	if !exists {
+		err = client.MakeBucket(ctx, bucketName, minio.MakeBucketOptions{})
+		if err != nil {
+			return nil, "", fmt.Errorf("failed to create bucket: %v", err)
+		}
+		fmt.Printf("Created MinIO bucket: %s\n", bucketName)
+	}
+
+	return client, bucketName, nil
+}
+
+// getEnvOrDefault returns environment variable value or default if not set
+func getEnvOrDefault(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
 
 func main() {
 	// Command line flags
@@ -28,24 +76,39 @@ func main() {
 	)
 	flag.Parse()
 
-	// Initialize database
-	db, err := models.NewSQLiteDatabase(*dbPath)
-	if err != nil {
-		log.Fatalf("Failed to open database: %v", err)
+	// Initialize database - use PostgreSQL if POSTGRES_HOST is set, otherwise SQLite
+	var db models.Database
+	if os.Getenv("POSTGRES_HOST") != "" {
+		fmt.Println("Using PostgreSQL database")
+		pgDB, err := models.NewPostgresDatabase()
+		if err != nil {
+			log.Fatalf("Failed to open PostgreSQL database: %v", err)
+		}
+		defer pgDB.Close()
+		db = pgDB
+	} else {
+		fmt.Println("Using SQLite database")
+		sqliteDB, err := models.NewSQLiteDatabase(*dbPath)
+		if err != nil {
+			log.Fatalf("Failed to open SQLite database: %v", err)
+		}
+		defer sqliteDB.Close()
+		db = sqliteDB
 	}
-	defer db.Close()
 
-	// Run migrations
-	err = db.Migrate()
-	if err != nil {
-		log.Fatalf("Failed to run migrations: %v", err)
+	// Migrations are handled in the database constructors
+
+	// Initialize MinIO client (required)
+	if os.Getenv("MINIO_ENDPOINT") == "" {
+		log.Fatalf("MINIO_ENDPOINT environment variable is required")
 	}
 
-	// Initialize storage
-	localStorage, err := storage.NewLocalStorage(*storagePath, db)
+	fmt.Println("Using MinIO storage")
+	minioClient, bucketName, err := initializeMinIO()
 	if err != nil {
-		log.Fatalf("Failed to initialize storage: %v", err)
+		log.Fatalf("Failed to initialize MinIO: %v", err)
 	}
+	fmt.Printf("MinIO initialized with endpoint: %s, bucket: %s\n", os.Getenv("MINIO_ENDPOINT"), bucketName)
 
 	// Handle user management commands
 	if *createUser != "" {
@@ -90,7 +153,7 @@ func main() {
 
 	// Initialize handlers
 	coreHandlers := handlers.NewCoreHandlers(db)
-	wharfHandlers := handlers.NewWharfHandlers(db, localStorage)
+	wharfHandlers := handlers.NewWharfHandlers(db, minioClient, bucketName)
 
 	// Setup router
 	r := mux.NewRouter()
@@ -113,6 +176,37 @@ func main() {
 			next.ServeHTTP(w, req)
 		})
 	})
+
+	// Test endpoint for MinIO
+	r.HandleFunc("/test/minio", func(w http.ResponseWriter, r *http.Request) {
+		// Upload a test file to MinIO
+		testContent := "Hello from MinIO! This is a test file."
+		objectName := "test/hello.txt"
+
+		ctx := context.Background()
+		_, err := minioClient.PutObject(ctx, bucketName, objectName, strings.NewReader(testContent), int64(len(testContent)), minio.PutObjectOptions{
+			ContentType: "text/plain",
+		})
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Failed to upload test file: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		// Generate signed URL (expires in 1 hour)
+		signedURL, err := minioClient.PresignedGetObject(ctx, bucketName, objectName, time.Hour, nil)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Failed to generate signed URL: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"message":      "Test file uploaded successfully",
+			"signed_url":   signedURL.String(),
+			"expires_in":   "1 hour",
+			"test_content": testContent,
+		})
+	}).Methods("GET")
 
 	// Public routes (no authentication required)
 	r.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -211,19 +305,18 @@ window.location.href = "%s";
 	wharf.HandleFunc("/builds/{buildId}/files/{fileId}", wharfHandlers.FinalizeBuildFile).Methods("POST")
 	wharf.HandleFunc("/builds/{buildId}/files/{fileId}/download", wharfHandlers.GetBuildFileDownload).Methods("GET", "HEAD")
 
-	// Upload endpoints
-	upload := r.PathPrefix("/upload").Subrouter()
-	upload.HandleFunc("/{sessionId}", localStorage.HandleUpload).Methods("POST", "PUT", "PATCH")
-
-	// Download endpoints
-	download := r.PathPrefix("/downloads").Subrouter()
-	download.HandleFunc("/builds/{buildId}/files/{fileId}", localStorage.HandleDownload).Methods("GET")
-	download.HandleFunc("/uploads/{uploadId}/{filename}", localStorage.HandleDownload).Methods("GET")
-
 	// Start server
 	fmt.Printf("Starting server on port %s\n", *port)
-	fmt.Printf("Database: %s\n", *dbPath)
-	fmt.Printf("Storage: %s\n", *storagePath)
+	if os.Getenv("POSTGRES_HOST") != "" {
+		fmt.Printf("Database: PostgreSQL (%s:%s/%s)\n", os.Getenv("POSTGRES_HOST"), os.Getenv("POSTGRES_PORT"), os.Getenv("POSTGRES_DB"))
+	} else {
+		fmt.Printf("Database: SQLite (%s)\n", *dbPath)
+	}
+	if os.Getenv("MINIO_ENDPOINT") != "" {
+		fmt.Printf("Storage: MinIO (%s)\n", os.Getenv("MINIO_ENDPOINT"))
+	} else {
+		fmt.Printf("Storage: Local (%s)\n", *storagePath)
+	}
 	fmt.Printf("\nTo create a test user, run:\n")
 	fmt.Printf("  %s -create-user=myusername\n", os.Args[0])
 	fmt.Printf("\nThen configure butler with:\n")

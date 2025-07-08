@@ -1,8 +1,8 @@
 package auth
 
 import (
+	"butler-server/models"
 	"context"
-	"simple-butler-server/models"
 )
 
 type contextKey string

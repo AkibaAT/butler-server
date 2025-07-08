@@ -17,7 +17,7 @@ A minimal butler-compatible server implementation for hosting your own game dist
 
 ```bash
 # Clone/copy the server code
-cd simple-butler-server
+cd butler-server
 
 # Build
 go build -o butler-server

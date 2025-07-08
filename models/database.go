@@ -468,35 +468,7 @@ func (d *SQLiteDatabase) UpdateChannel(channel *Channel) error {
 	return err
 }
 
-// UploadSession database methods
-func (d *SQLiteDatabase) GetUploadSession(id string) (*UploadSession, error) {
-	session := &UploadSession{}
-	err := d.db.QueryRow(`
-		SELECT id, build_file_id, storage_path, size, state, created_at, updated_at
-		FROM upload_sessions WHERE id = ?`, id).Scan(
-		&session.ID, &session.BuildFileID, &session.StoragePath, &session.Size,
-		&session.State, &session.CreatedAt, &session.UpdatedAt)
-	if err != nil {
-		return nil, err
-	}
-	return session, nil
-}
-
-func (d *SQLiteDatabase) CreateUploadSession(session *UploadSession) error {
-	_, err := d.db.Exec(`
-		INSERT INTO upload_sessions (id, build_file_id, storage_path, size, state, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'))`,
-		session.ID, session.BuildFileID, session.StoragePath, session.Size, session.State)
-	return err
-}
-
-func (d *SQLiteDatabase) UpdateUploadSession(session *UploadSession) error {
-	_, err := d.db.Exec(`
-		UPDATE upload_sessions SET build_file_id = ?, storage_path = ?, size = ?, state = ?, updated_at = datetime('now')
-		WHERE id = ?`,
-		session.BuildFileID, session.StoragePath, session.Size, session.State, session.ID)
-	return err
-}
+// UploadSession methods removed - using MinIO presigned URLs instead
 
 // Initialize database with migrations
 func (d *SQLiteDatabase) Migrate() error {

@@ -1,8 +1,8 @@
 package auth
 
 import (
+	"butler-server/models"
 	"fmt"
-	"simple-butler-server/models"
 )
 
 // CreateUser creates a new user with the specified role
@@ -61,7 +61,7 @@ func ListUsers(db models.Database) error {
 		if len(apiKeyDisplay) > 16 {
 			apiKeyDisplay = apiKeyDisplay[:16] + "..."
 		}
-		fmt.Printf("%-10d %-20s %-10s %-8s %-20s\n", 
+		fmt.Printf("%-10d %-20s %-10s %-8s %-20s\n",
 			user.ID, user.Username, user.Role, activeStr, apiKeyDisplay)
 	}
 	return nil

@@ -94,17 +94,6 @@ type Channel struct {
 	UpdatedAt      time.Time `json:"updated_at" db:"updated_at"`
 }
 
-// UploadSession represents a resumable upload session
-type UploadSession struct {
-	ID          string    `json:"id" db:"id"`
-	BuildFileID int64     `json:"build_file_id" db:"build_file_id"`
-	StoragePath string    `json:"storage_path" db:"storage_path"`
-	Size        int64     `json:"size" db:"size"`
-	State       string    `json:"state" db:"state"`
-	CreatedAt   time.Time `json:"created_at" db:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at" db:"updated_at"`
-}
-
 // Database interface for testing
 type Database interface {
 	// Users
@@ -143,11 +132,6 @@ type Database interface {
 	GetChannelsByUploadID(uploadID int64) ([]*Channel, error)
 	CreateChannel(channel *Channel) error
 	UpdateChannel(channel *Channel) error
-
-	// Upload Sessions
-	GetUploadSession(id string) (*UploadSession, error)
-	CreateUploadSession(session *UploadSession) error
-	UpdateUploadSession(session *UploadSession) error
 
 	Close() error
 }
