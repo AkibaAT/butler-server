@@ -211,7 +211,7 @@ func main() {
 	// Public routes (no authentication required)
 	r.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"message":"Simple Butler Server","version":"1.0.0"}`)
+		fmt.Fprintf(w, `{"message":"Butler Server","version":"1.0.0"}`)
 	}).Methods("GET")
 
 	// OAuth endpoints for butler login

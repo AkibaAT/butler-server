@@ -1,89 +1,96 @@
-# Simple Butler Server
+# Butler Server
 
-A minimal butler-compatible server implementation for hosting your own game distribution platform. Compatible with the itch.io butler command-line tool.
+A butler-compatible server for hosting your own game distribution. Works with the itch.io butler CLI tool.
 
-## Features
+## What it does
 
-- **Butler CLI compatibility**: Works with the existing butler push/fetch commands
-- **Wharf patch system**: Supports incremental updates and patch creation
-- **Local file storage**: Simple local filesystem storage for game files
-- **SQLite database**: Lightweight database for metadata storage
-- **Resumable uploads**: Supports chunked uploads for large files
-- **User authentication**: API key-based authentication
+- **Butler CLI support**: All the usual `butler push/fetch/status` commands work
+- **Wharf patches**: Incremental updates and patch creation
+- **MinIO storage**: S3-compatible storage with secure downloads
+- **PostgreSQL**: Real database instead of SQLite
+- **Direct uploads**: Files go straight to storage via presigned URLs
+- **User isolation**: Users can only mess with their own games
+- **Admin access**: Admins can manage any namespace
+- **DDEV setup**: Just `ddev start` and you're running
 
 ## Quick Start
 
-### 1. Build and Run
+### Get it running
 
 ```bash
-# Clone/copy the server code
+# Clone and start
+git clone <repository-url>
 cd butler-server
+ddev start
 
-# Build
-go build -o butler-server
-
-# Create a test user
-./butler-server -create-user=myusername
+# Build and create a user
+ddev exec "go build -o butler-server ."
+ddev exec "./butler-server --create-user=myusername"
 
 # Start the server
-./butler-server
+ddev exec "./butler-server"
 ```
 
-### 2. Configure Butler
+### Use butler with it
 
 ```bash
-# Point butler to your server
-butler --address=http://localhost:8080 login
+# Point butler at your server
+butler --address=https://butler-server.ddev.site login
+# (paste the API key from when you created the user)
 
-# When prompted for OAuth, it will automatically create a test user
-```
-
-### 3. Push Your First Game
-
-```bash
-# Create a test game directory
+# Push a game
 mkdir my-game
-echo "Hello World" > my-game/game.txt
+echo "Hello World v1.0" > my-game/game.txt
+butler --address=https://butler-server.ddev.site push my-game myusername/my-game:main
 
-# Push to your server
-butler --address=http://localhost:8080 push my-game myusername/my-game:windows
+# Check it worked
+butler --address=https://butler-server.ddev.site status myusername/my-game:main
 ```
 
 ## Usage
 
-### Server Commands
+### Managing users
 
 ```bash
-# Start server (default port 8080)
-./butler-server
+# Create users
+ddev exec "./butler-server --create-user=alice"      # Regular user
+ddev exec "./butler-server --create-admin=admin"     # Admin user
 
-# Custom port and paths
-./butler-server -port=9090 -db=./my-games.db -storage=./my-files
+# See who exists
+ddev exec "./butler-server --list-users"
 
-# Create a user
-./butler-server -create-user=username
+# Enable/disable users
+ddev exec "./butler-server --activate-user=alice"
+ddev exec "./butler-server --deactivate-user=alice"
 ```
 
-### Butler Commands
+### Butler commands
 
 ```bash
-# Set server address for all commands
-export BUTLER_API_SERVER=http://localhost:8080
+# Set this once to avoid typing --address every time
+export BUTLER_API_SERVER=https://butler-server.ddev.site
 
-# Or use the --address flag
-butler --address=http://localhost:8080 <command>
-
-# Login (creates test user automatically)
+# Login with your API key
 butler login
 
-# Push a game
-butler push /path/to/game username/gamename:channel
+# Push games (format: username/gamename:channel)
+butler push /path/to/game username/gamename:main
+butler push /path/to/game username/gamename:beta
 
-# Check status
-butler status username/gamename:channel
+# Check what's up
+butler status username/gamename:main
+butler fetch username/gamename:main
+butler channels username/gamename
+```
 
-# List your games (via API)
-curl "http://localhost:8080/profile/games?api_key=YOUR_API_KEY"
+### Direct API calls
+
+```bash
+# Grab your API key from user creation, then:
+API_KEY="your-api-key-here"
+
+curl -H "Authorization: $API_KEY" https://butler-server.ddev.site/wharf/status
+curl -H "Authorization: $API_KEY" https://butler-server.ddev.site/profile/games
 ```
 
 ## API Endpoints
@@ -97,123 +104,292 @@ GET  /games/{id}                # Get game info
 GET  /games/{id}/uploads        # List game uploads
 GET  /uploads/{id}              # Get upload info
 GET  /uploads/{id}/builds       # List upload builds
-GET  /uploads/{id}/download     # Get download URL
 GET  /builds/{id}               # Get build info
 ```
 
-### Wharf API (Butler Push)
+### Wharf API (Butler Compatible)
 
 ```
-GET  /wharf/status                           # Check status
-GET  /wharf/channels/{channel}               # Get channel info
-POST /wharf/builds                           # Create build
-GET  /wharf/builds/{id}/files               # List build files
-POST /wharf/builds/{id}/files               # Create build file
-POST /wharf/builds/{buildId}/files/{fileId} # Finalize file
-GET  /wharf/builds/{buildId}/files/{fileId}/download # Download file
+GET  /wharf/status                                    # Check server status
+GET  /wharf/channels                                  # List all channels
+GET  /wharf/channels/{channel}                        # Get channel info
+POST /wharf/builds                                    # Create new build
+GET  /wharf/builds/{id}/files                        # List build files
+POST /wharf/builds/{id}/files                        # Create build file (get upload URL)
+POST /wharf/builds/{buildId}/files/{fileId}          # Finalize uploaded file
+GET  /wharf/builds/{buildId}/files/{fileId}/download  # Get download redirect
 ```
 
-### Upload/Download
+### File Upload/Download Flow
 
-```
-POST /upload/{sessionId}                    # Upload file chunks
-GET  /downloads/builds/{buildId}/files/{fileId}     # Download build file
-GET  /downloads/uploads/{uploadId}/{filename}       # Download upload
-```
+1. **Upload**: Client calls `POST /wharf/builds/{id}/files` → Gets presigned MinIO upload URL → Uploads directly to MinIO → Calls finalize endpoint
+2. **Download**: Client calls download endpoint → Server returns redirect to signed MinIO URL → Client downloads directly from MinIO
+
+**No direct upload/download endpoints** - files go straight to/from MinIO using signed URLs.
 
 ## Configuration
 
 ### Environment Variables
 
+**Database (PostgreSQL):**
+- `POSTGRES_HOST`: Database host (default: `db` in DDEV)
+- `POSTGRES_PORT`: Database port (default: `5432`)
+- `POSTGRES_DB`: Database name (default: `db`)
+- `POSTGRES_USER`: Database user (default: `db`)
+- `POSTGRES_PASSWORD`: Database password (default: `db`)
+
+**Storage (MinIO):**
+- `MINIO_ENDPOINT`: MinIO endpoint (default: `minio:9000` in DDEV)
+- `MINIO_ACCESS_KEY`: MinIO access key (default: `ddevminio`)
+- `MINIO_SECRET_KEY`: MinIO secret key (default: `ddevminio`)
+- `MINIO_BUCKET`: Storage bucket name (default: `butler-storage`)
+- `MINIO_USE_SSL`: Use SSL for MinIO (default: `false`)
+
+**Butler Client:**
 - `BUTLER_API_SERVER`: Server URL for butler commands
 - `BUTLER_API_KEY`: API key for authentication
 
 ### Server Flags
 
-- `-port`: Server port (default: 8080)
-- `-db`: SQLite database path (default: ./butler-server.db)
-- `-storage`: File storage directory (default: ./storage)
-- `-create-user`: Create a test user and exit
+- `--port`: Server port (default: `8080`)
+- `--create-user=username`: Create a regular user and exit
+- `--create-admin=username`: Create an admin user and exit
+- `--list-users`: List all users and exit
+- `--activate-user=username`: Activate user account
+- `--deactivate-user=username`: Deactivate user account
 
-## Database Schema
+## Architecture
 
-The server uses SQLite with these main tables:
+### Database Schema (PostgreSQL)
 
-- **users**: User accounts and API keys
-- **games**: Game metadata
-- **uploads**: File uploads for games
-- **builds**: Wharf builds (versions)
-- **build_files**: Individual files within builds
-- **channels**: Distribution channels (e.g., "windows", "linux")
-- **upload_sessions**: Resumable upload tracking
+The server uses PostgreSQL with these main tables:
 
-## File Storage
+- **users**: User accounts, API keys, and roles (`user`/`admin`)
+- **games**: Game metadata with namespace ownership
+- **uploads**: Upload metadata (files stored in MinIO)
+- **builds**: Wharf builds (versions) with state tracking
+- **build_files**: Individual files within builds (stored in MinIO)
+- **channels**: Distribution channels (`main`, `beta`, etc.)
 
-Files are stored locally in the storage directory:
+### File Storage (MinIO S3)
+
+Files are stored in MinIO object storage with authenticated access:
 
 ```
-storage/
+butler-storage/           # MinIO bucket
 ├── builds/
-│   ├── 1/          # Build ID 1
-│   │   ├── patch_default_uuid1
-│   │   └── signature_default_uuid2
-│   └── 2/          # Build ID 2
-└── uploads/
-    └── 1/          # Upload ID 1
-        └── game.zip
+│   ├── 1/               # Build ID 1
+│   │   ├── archive_default_uuid1.zip
+│   │   ├── patch_default_uuid2
+│   │   └── signature_default_uuid3
+│   └── 2/               # Build ID 2
+└── test/                # Test files
+    └── hello.txt
 ```
+
+**How files work:**
+- Private bucket (no public access)
+- Upload URLs expire in 1 hour
+- Download URLs expire in 1 hour
+- Files go directly to/from MinIO (server doesn't proxy)
+
+### How security works
+
+- **Regular users**: Can only touch `username/*` games
+- **Admin users**: Can access any namespace, but games stay owned by the original user
+- **Isolation**: Users can't see each other's stuff
+- **Ownership**: Games belong to the namespace owner, not whoever created them
 
 ## Development
 
-### Testing with curl
+### DDEV Environment
+
+The project includes a complete DDEV configuration:
+
+```yaml
+# .ddev/config.yaml
+name: butler-server
+type: generic
+docroot: .
+php_version: "8.3"
+nodejs_version: "22"
+database:
+  type: postgres
+  version: "17"
+```
+
+**Services:**
+- **Web**: Generic container with Go 1.24+ and butler CLI
+- **Database**: PostgreSQL 17 with automatic migrations
+- **MinIO**: S3-compatible storage with web UI at https://butler-server.ddev.site:9090
+
+### Testing
 
 ```bash
-# Get server info
-curl http://localhost:8080/
+# Test server status
+curl -s https://butler-server.ddev.site/test/minio | jq .
 
-# Create user (server must be running)
-./butler-server -create-user=testuser
-
-# Test API (replace with your API key)
+# Test API with authentication
 API_KEY="your-api-key-here"
-curl "http://localhost:8080/profile?api_key=$API_KEY"
+curl -H "Authorization: $API_KEY" https://butler-server.ddev.site/wharf/status
 
-# Test game creation via butler
-butler --address=http://localhost:8080 push ./test-game testuser/test-game:windows
+# Test complete butler workflow
+mkdir test-game && echo "Hello World" > test-game/game.txt
+butler --address=https://butler-server.ddev.site push test-game testuser/test-game:main
+butler --address=https://butler-server.ddev.site status testuser/test-game:main
+butler --address=https://butler-server.ddev.site fetch testuser/test-game:main
+```
+
+### Database Access
+
+```bash
+# Connect to PostgreSQL
+ddev exec "psql -h db -U db -d db"
+
+# View current data
+ddev exec "psql -h db -U db -d db -c 'SELECT u.username, g.title FROM games g JOIN users u ON g.user_id = u.id;'"
 ```
 
 ### Adding Features
 
 The server is designed to be extensible:
 
-1. **models/**: Add new database models
-2. **handlers/**: Add new API endpoints
-3. **storage/**: Extend storage backends (S3, GCS, etc.)
-4. **auth/**: Add new authentication methods
+1. **models/**: Database models and interfaces
+2. **handlers/**: HTTP handlers for API endpoints
+3. **auth/**: Authentication and authorization
+4. **migrations/**: Database schema changes
 
-## Limitations
+## What's good about it
 
-This is a simple implementation for development/testing:
+- **Real database**: PostgreSQL instead of SQLite
+- **Proper storage**: MinIO/S3 instead of local files
+- **Actually secure**: Users can't access each other's games
+- **Fast uploads/downloads**: Files go directly to storage
+- **Good error handling**: Won't crash on bad requests
+- **Request logging**: See what's happening
+- **HTTPS ready**: Works behind nginx/cloudflare/whatever
 
-- **No user registration UI**: Users are created via command line
-- **Basic authentication**: Only API key auth, no OAuth flow
-- **Local storage only**: No cloud storage integration
-- **No admin interface**: Database management via SQL only
-- **Minimal error handling**: Basic error responses
-- **No rate limiting**: No protection against abuse
-- **No HTTPS**: Development only, add reverse proxy for production
+## Running it for real
 
-## Production Considerations
+### Docker
 
-For production use, consider:
+```bash
+# Build it
+docker build -t butler-server .
 
-1. **HTTPS**: Use nginx/caddy as reverse proxy
-2. **Database**: PostgreSQL for better concurrency
-3. **Storage**: S3/GCS for scalability
-4. **Authentication**: Proper OAuth implementation
-5. **Monitoring**: Add logging and metrics
-6. **Security**: Input validation, rate limiting
-7. **Backup**: Database and file backup strategy
+# Run it (you'll need postgres and minio somewhere)
+docker run -d \
+  -e POSTGRES_HOST=your-postgres-host \
+  -e POSTGRES_USER=butler \
+  -e POSTGRES_PASSWORD=secure-password \
+  -e MINIO_ENDPOINT=your-minio-endpoint \
+  -e MINIO_ACCESS_KEY=your-access-key \
+  -e MINIO_SECRET_KEY=your-secret-key \
+  -p 8080:8080 \
+  butler-server
+```
+
+### Kubernetes
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: butler-server
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: butler-server
+  template:
+    metadata:
+      labels:
+        app: butler-server
+    spec:
+      containers:
+      - name: butler-server
+        image: butler-server:latest
+        ports:
+        - containerPort: 8080
+        env:
+        - name: POSTGRES_HOST
+          value: "postgres-service"
+        - name: MINIO_ENDPOINT
+          value: "minio-service:9000"
+        # Add other environment variables
+```
+
+### Scaling it
+
+- **Database**: PostgreSQL handles lots of connections
+- **Storage**: MinIO clusters or just use AWS S3
+- **Stateless**: Servers don't store anything, spin up as many as you want
+- **CDN**: Stick CloudFront in front of MinIO for global downloads
+
+## Security stuff
+
+### Users and permissions
+
+- **API keys**: Each user gets a token
+- **Roles**: Regular users vs admins
+- **Namespaces**: Users can only touch their own games
+- **Ownership**: Games belong to the namespace, not who created them
+
+### File security
+
+- **Private bucket**: No public access to MinIO
+- **Timed URLs**: Upload/download URLs expire in 1 hour
+- **Signed URLs**: Can't be faked or modified
+- **No direct access**: Everything goes through authentication
+
+### Other security
+
+- **PostgreSQL**: Proper database with foreign keys
+- **Environment config**: No passwords in code
+- **Request logging**: See who's doing what
+- **Input validation**: Won't crash on garbage input
+
+## Checking if it's working
+
+### Health checks
+
+```bash
+# Is the server up?
+curl https://butler-server.ddev.site/wharf/status
+
+# Can it talk to the database?
+curl -H "Authorization: $API_KEY" https://butler-server.ddev.site/profile
+
+# Can it talk to MinIO?
+curl https://butler-server.ddev.site/test/minio
+```
+
+### What gets logged
+
+The server logs:
+- All HTTP requests (method, path, response code)
+- Authentication attempts
+- Errors with stack traces
+- Database queries (if you want)
+
+### Database queries
+
+```sql
+-- How many connections?
+SELECT count(*) FROM pg_stat_activity;
+
+-- How big are the tables?
+SELECT schemaname,tablename,pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) as size
+FROM pg_tables WHERE schemaname='public';
+
+-- What's been happening lately?
+SELECT g.title, u.username, b.created_at
+FROM builds b
+JOIN uploads up ON b.upload_id = up.id
+JOIN games g ON up.game_id = g.id
+JOIN users u ON g.user_id = u.id
+ORDER BY b.created_at DESC LIMIT 10;
+```
 
 ## License
 

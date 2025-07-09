@@ -1,0 +1,117 @@
+version: '3.8'
+
+services:
+  # Butler Server Application
+  butler-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: butler-server
+    restart: unless-stopped
+    environment:
+      - POSTGRES_HOST=${POSTGRES_HOST}
+      - POSTGRES_PORT=${POSTGRES_PORT}
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - MINIO_ENDPOINT=${MINIO_ENDPOINT}
+      - MINIO_PUBLIC_ENDPOINT=${MINIO_PUBLIC_ENDPOINT}
+      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY}
+      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
+      - MINIO_BUCKET=${MINIO_BUCKET}
+      - MINIO_USE_SSL=${MINIO_USE_SSL}
+      - PORT=${PORT}
+      - GIN_MODE=${GIN_MODE}
+      - LOG_LEVEL=${LOG_LEVEL}
+    depends_on:
+      - db
+      - minio
+    networks:
+      - default
+      - ${TRAEFIK_NETWORK}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=${TRAEFIK_NETWORK}"
+      
+      # Main Butler Server
+      - "traefik.http.services.butler-server.loadbalancer.server.port=${PORT}"
+      - "traefik.http.routers.butler-server.rule=Host(`${BUTLER_SUBDOMAIN}.${DOMAIN}`)"
+      - "traefik.http.routers.butler-server.entrypoints=websecure"
+      - "traefik.http.routers.butler-server.tls=true"
+      - "traefik.http.routers.butler-server.service=butler-server"
+      
+      # API Subdomain (same service, different route)
+      - "traefik.http.routers.butler-api.rule=Host(`${BUTLER_API_SUBDOMAIN}.${DOMAIN}`)"
+      - "traefik.http.routers.butler-api.entrypoints=websecure"
+      - "traefik.http.routers.butler-api.tls=true"
+      - "traefik.http.routers.butler-api.service=butler-server"
+
+  # PostgreSQL Database
+  db:
+    image: postgres:17-alpine
+    container_name: butler-db
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d
+    networks:
+      - default
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # MinIO Object Storage
+  minio:
+    image: minio/minio:latest
+    container_name: butler-minio
+    restart: unless-stopped
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - default
+      - ${TRAEFIK_NETWORK}
+    ports:
+      - "127.0.0.1:9001:9001"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=${TRAEFIK_NETWORK}"
+      
+      # MinIO API (public for storage access)
+      - "traefik.http.services.minio-api.loadbalancer.server.port=9000"
+      - "traefik.http.routers.minio-api.rule=Host(`${BUTLER_STORAGE_SUBDOMAIN}.${DOMAIN}`)"
+      - "traefik.http.routers.minio-api.entrypoints=websecure"
+      - "traefik.http.routers.minio-api.tls=true"
+      - "traefik.http.routers.minio-api.service=minio-api"
+      
+      # MinIO Console - NOT exposed publicly (access via SSH tunnel)
+      # Port 9001 is available internally for SSH tunnel access
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  postgres_data:
+    name: ${DB_VOLUME_NAME}
+  minio_data:
+    name: ${MINIO_VOLUME_NAME}
+
+networks:
+  web:
+    name: web
+    external: true
+  default:
+    name: butler-network

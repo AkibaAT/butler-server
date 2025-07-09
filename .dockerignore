@@ -1,0 +1,33 @@
+# Development files
+.ddev/
+.env
+.env.example
+.git/
+.gitignore
+README.md
+docker-compose.yml
+Dockerfile
+
+# Build artifacts
+butler-server
+
+# Development directories
+simple-butler-server/
+fetch-test-*/
+
+# Logs
+*.log
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test files
+*_test.go
+test/

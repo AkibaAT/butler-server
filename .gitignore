@@ -1,6 +1,7 @@
 # Go binaries
 butler-server
 butler-server.exe
+*.exe
 
 # Database files
 *.db
@@ -10,10 +11,6 @@ butler-server.exe
 # Storage directory
 storage/
 files/
-
-# Go module cache
-go.mod
-go.sum
 
 # IDE files
 .vscode/
@@ -27,6 +24,47 @@ Thumbs.db
 
 # Log files
 *.log
+logs/
 
-# Environment files
+# Environment files (all variants)
 .env
+.env.local
+.env.production
+.env.staging
+.env.development
+
+# Backup files
+backups/
+*.sql
+*.tar.gz
+
+# SSL certificates
+*.crt
+*.key
+*.pem
+
+# Development files
+.ddev/
+simple-butler-server/
+fetch-test-*/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Test files
+*_test.go
+test/
+coverage.out
+
+# Dependencies
+vendor/
+
+# Go specific
+*.out
+*.test
+*.prof
+
+# Docker overrides
+docker-compose.override.yml

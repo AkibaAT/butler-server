@@ -10,10 +10,8 @@ services:
       MINIO_GID: $DDEV_GID
       MINIO_ROOT_USER: ddevminio
       MINIO_ROOT_PASSWORD: ddevminio
-      MINIO_BROWSER_REDIRECT_URL: https://butler-server.ddev.site:9090
-      VIRTUAL_HOST: $DDEV_HOSTNAME
-      HTTP_EXPOSE: "9089:9090,9000:9000"
-      HTTPS_EXPOSE: "9090:9090,9000:9000"
+      MINIO_BROWSER_REDIRECT_URL: https://storage.butler-server.ddev.site
+      VIRTUAL_HOST: storage.butler-server.ddev.site
     command: server --console-address :9090 --address :9000
     volumes:
       - "minio:/data"

@@ -6,6 +6,7 @@ xdebug_enabled: false
 additional_hostnames:
   - "butler-server"
   - "api.butler-server"
+  - "storage.butler-server"
 additional_fqdns: []
 database:
     type: postgres
