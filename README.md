@@ -1,17 +1,23 @@
 # Butler Server
 
-A butler-compatible server for hosting your own game distribution. Works with the itch.io butler CLI tool.
+## What is this?
+
+Butler Server is a self-hosted game distribution server that works with the itch.io butler CLI tool. It allows developers to run their own game distribution infrastructure while maintaining full compatibility with existing butler workflows.
+
+**⚠️ Early Development Warning**
+
+This project is in **very early proof-of-concept** stage. The basic functionality works, but consider this experimental code. It's not ready for production use yet, and things might break or change as development continues. Great for experimenting and testing though!
 
 ## What it does
 
-- **Butler CLI support**: All the usual `butler push/fetch/status` commands work
-- **Wharf patches**: Incremental updates and patch creation
+- **Butler CLI support**: `butler push/status/channels` commands work, `fetch` has known issues
+- **Build versioning**: Parent build tracking for future patch support
 - **MinIO storage**: S3-compatible storage with secure downloads
-- **PostgreSQL**: Real database instead of SQLite
+- **PostgreSQL database**: Reliable database backend
 - **Direct uploads**: Files go straight to storage via presigned URLs
-- **User isolation**: Users can only mess with their own games
+- **User isolation**: Users can only access their own games
 - **Admin access**: Admins can manage any namespace
-- **DDEV setup**: Just `ddev start` and you're running
+- **DDEV setup**: Streamlined development environment (requires `ddev start` + build step)
 
 ## Quick Start
 
@@ -79,8 +85,9 @@ butler push /path/to/game username/gamename:beta
 
 # Check what's up
 butler status username/gamename:main
-butler fetch username/gamename:main
 butler channels username/gamename
+
+# Note: butler fetch has known issues in current version
 ```
 
 ### Direct API calls
@@ -125,7 +132,7 @@ GET  /wharf/builds/{buildId}/files/{fileId}/download  # Get download redirect
 1. **Upload**: Client calls `POST /wharf/builds/{id}/files` → Gets presigned MinIO upload URL → Uploads directly to MinIO → Calls finalize endpoint
 2. **Download**: Client calls download endpoint → Server returns redirect to signed MinIO URL → Client downloads directly from MinIO
 
-**No direct upload/download endpoints** - files go straight to/from MinIO using signed URLs.
+**Direct storage**: Files go straight to/from MinIO using signed URLs - no server bottlenecks.
 
 ## Configuration
 
@@ -179,10 +186,9 @@ Files are stored in MinIO object storage with authenticated access:
 butler-storage/           # MinIO bucket
 ├── builds/
 │   ├── 1/               # Build ID 1
-│   │   ├── archive_default_uuid1.zip
-│   │   ├── patch_default_uuid2
-│   │   └── signature_default_uuid3
+│   │   └── archive_default_uuid1.zip
 │   └── 2/               # Build ID 2
+│       └── archive_default_uuid2.zip
 └── test/                # Test files
     └── hello.txt
 ```
@@ -195,9 +201,9 @@ butler-storage/           # MinIO bucket
 
 ### How security works
 
-- **Regular users**: Can only touch `username/*` games
+- **Regular users**: Can only access `username/*` games
 - **Admin users**: Can access any namespace, but games stay owned by the original user
-- **Isolation**: Users can't see each other's stuff
+- **User isolation**: Users can't see each other's stuff
 - **Ownership**: Games belong to the namespace owner, not whoever created them
 
 ## Development
@@ -233,11 +239,10 @@ curl -s https://butler-server.ddev.site/test/minio | jq .
 API_KEY="your-api-key-here"
 curl -H "Authorization: $API_KEY" https://butler-server.ddev.site/wharf/status
 
-# Test complete butler workflow
+# Test butler workflow (push and status work, fetch has issues)
 mkdir test-game && echo "Hello World" > test-game/game.txt
 butler --address=https://butler-server.ddev.site push test-game testuser/test-game:main
 butler --address=https://butler-server.ddev.site status testuser/test-game:main
-butler --address=https://butler-server.ddev.site fetch testuser/test-game:main
 ```
 
 ### Database Access
@@ -259,15 +264,15 @@ The server is designed to be extensible:
 3. **auth/**: Authentication and authorization
 4. **migrations/**: Database schema changes
 
-## What's good about it
+## Why it's built this way
 
-- **Real database**: PostgreSQL instead of SQLite
-- **Proper storage**: MinIO/S3 instead of local files
-- **Actually secure**: Users can't access each other's games
-- **Fast uploads/downloads**: Files go directly to storage
-- **Good error handling**: Won't crash on bad requests
-- **Request logging**: See what's happening
-- **HTTPS ready**: Works behind nginx/cloudflare/whatever
+- **PostgreSQL database**: Reliable multi-user database backend
+- **MinIO/S3 storage**: Better than local files, works with CDNs and scales nicely
+- **User isolation**: People can't mess with each other's games
+- **Direct file transfers**: Fast uploads/downloads, server doesn't get in the way
+- **Good error handling**: Won't crash on weird requests
+- **Request logging**: You can see what's happening
+- **HTTPS ready**: Works behind nginx, cloudflare, whatever you use
 
 ## Running it for real
 
